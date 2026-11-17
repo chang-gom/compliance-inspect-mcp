@@ -140,3 +140,22 @@ def test_mcp_server_exposes_tools_and_runs(db, monkeypatch):
     }
     result = asyncio.run(server.server.call_tool("find_registration_gaps", {"category_code": "FOOD"}))
     assert "P2" in str(result)
+
+
+@pytest.mark.parametrize("tool, args, expected", [
+    ("rejection_pattern_report", {"group_by": "brand"}, "group_by는"),
+    ("find_registration_gaps", {"category_code": "XYZ"}, "사용 가능: ELEC, FOOD"),
+    ("run_readonly_sql", {"sql": "DELETE FROM products"}, "SELECT 또는 WITH"),
+    ("run_readonly_sql", {"sql": "WITH x AS (SELECT 1) DELETE FROM products"}, "읽기 이외의 동작"),
+])
+def test_mcp_errors_reach_client_with_reason(db, monkeypatch, tool, args, expected):
+    """Claude가 오류 이유를 보고 입력을 고쳐 다시 호출할 수 있어야 한다."""
+    from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+
+    monkeypatch.setenv("COMPLIANCE_DB", str(db))
+    sys.modules.pop("server", None)
+    import server
+
+    with pytest.raises(ToolError, match=expected) as exc:
+        asyncio.run(server.server.call_tool(tool, args))
+    assert not isinstance(exc.value, UnexpectedToolError)

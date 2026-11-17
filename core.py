@@ -227,6 +227,10 @@ def run_readonly_sql(conn: sqlite3.Connection, sql: str, max_rows: int = 200) ->
     try:
         cur = conn.execute(stripped)
         rows = cur.fetchmany(max_rows + 1)
+    except sqlite3.DatabaseError as e:
+        if "not authorized" in str(e):
+            raise ValueError("읽기 이외의 동작(UPDATE·DELETE·DDL·PRAGMA 등)은 허용되지 않습니다.") from e
+        raise
     finally:
         conn.set_authorizer(None)
     columns = [c[0] for c in cur.description]
