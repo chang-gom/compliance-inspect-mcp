@@ -1,0 +1,119 @@
+import asyncio
+import sqlite3
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+import core  # noqa: E402
+
+
+@pytest.fixture()
+def db(tmp_path):
+    """결과를 손으로 계산할 수 있는 작은 고정 데이터."""
+    path = tmp_path / "t.db"
+    c = sqlite3.connect(path)
+    c.executescript(core.SCHEMA)
+    c.executescript("""
+        INSERT INTO meta VALUES ('snapshot_date', '2026-11-15');
+        INSERT INTO categories VALUES ('FOOD', '가공식품'), ('ELEC', '생활가전');
+        INSERT INTO required_documents VALUES
+            ('FOOD', '품목제조보고서', '식품위생법'),
+            ('FOOD', '자가품질검사성적서', '식품위생법'),
+            ('ELEC', 'KC 인증서', '전기생활용품안전법');
+        INSERT INTO suppliers VALUES ('S01', 'A'), ('S02', 'B');
+        INSERT INTO reason_codes VALUES ('DOC_MISSING', '누락'), ('AD_CLAIM', '광고');
+        INSERT INTO products VALUES
+            ('P1', '누룽지', 'FOOD', 'S01', '맛있는 간식', '검수대기', '2026-11-01'),
+            ('P2', '그래놀라', 'FOOD', 'S02', '면역력 강화', '검수대기', '2026-11-01'),
+            ('P3', '주전자', 'ELEC', 'S01', '편리함', '검수대기', '2026-11-01'),
+            ('P4', '선풍기', 'ELEC', 'S02', '편리함', '승인', '2026-11-01');
+        -- P1: 서류 2종 정상 / P2: 1종 누락 + 1종 만료 / P3: 정상(유효기간 없음) / P4: 승인건이라 제외
+        INSERT INTO product_documents VALUES
+            ('P1', '품목제조보고서', 'D1', '2027-01-01'),
+            ('P1', '자가품질검사성적서', 'D2', '2026-11-15'),
+            ('P2', '품목제조보고서', 'D3', '2026-11-14'),
+            ('P3', 'KC 인증서', 'D4', NULL);
+        INSERT INTO inspection_log (product_id, inspected_at, result, reason_code) VALUES
+            ('P1', '2026-11-10', 'PASS', NULL),
+            ('P2', '2026-11-10', 'REJECT', 'AD_CLAIM'),
+            ('P2', '2026-11-12', 'REJECT', 'DOC_MISSING'),
+            ('P3', '2026-11-12', 'PASS', NULL),
+            ('P4', '2026-09-01', 'REJECT', 'DOC_MISSING');  -- 30일 밖
+    """)
+    c.commit()
+    c.close()
+    return path
+
+
+def test_gaps_find_missing_and_expired_only(db):
+    with core.connect_readonly(db) as conn:
+        result = core.find_registration_gaps(conn)
+    issues = {(i["product_id"], i["doc_type"], i["issue"]) for i in result["items"]}
+    assert issues == {("P2", "자가품질검사성적서", "MISSING"), ("P2", "품목제조보고서", "EXPIRED")}
+    assert result["products_affected"] == 1
+    assert result["as_of"] == "2026-11-15"  # 만료일 당일(P1)은 유효로 본다
+
+
+def test_gaps_category_filter_and_limit(db):
+    with core.connect_readonly(db) as conn:
+        assert core.find_registration_gaps(conn, category_code="ELEC")["total_issues"] == 0
+        limited = core.find_registration_gaps(conn, limit=1)
+    assert len(limited["items"]) == 1 and limited["truncated"] is True
+
+
+def test_ad_copy_detects_category_terms():
+    result = core.check_ad_copy("FOOD", "면역력 강화에 좋은 업계 최고 간식")
+    assert result["verdict"] == "REVIEW"
+    assert [h["term"] for h in result["hits"]] == ["면역력 강화", "최고"]
+    assert core.check_ad_copy("ELEC", "면역력 강화")["verdict"] == "CLEAR"  # 식품 전용 규칙
+
+
+def test_rejection_report_by_reason_and_category(db):
+    with core.connect_readonly(db) as conn:
+        by_reason = core.rejection_pattern_report(conn, days=30, group_by="reason")
+        by_cat = core.rejection_pattern_report(conn, days=30, group_by="category")
+    assert {r["key"]: (r["rejected"], r["share_of_rejections"]) for r in by_reason["rows"]} == {
+        "AD_CLAIM": (1, 0.5), "DOC_MISSING": (1, 0.5)}
+    food = next(r for r in by_cat["rows"] if r["key"] == "FOOD")
+    assert (food["inspected"], food["rejected"], food["reject_rate"]) == (3, 2, 0.667)
+
+
+def test_rejection_report_rejects_unknown_group(db):
+    with core.connect_readonly(db) as conn, pytest.raises(ValueError):
+        core.rejection_pattern_report(conn, group_by="product_id; DROP TABLE products")
+
+
+def test_readonly_sql_allows_select_and_truncates(db):
+    with core.connect_readonly(db) as conn:
+        result = core.run_readonly_sql(conn, "SELECT product_id FROM products ORDER BY 1", max_rows=2)
+    assert result["rows"] == [["P1"], ["P2"]] and result["truncated"] is True
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE products SET status = '승인'",
+    "SELECT 1; DELETE FROM products",
+    "DROP TABLE products",
+    "WITH x AS (SELECT 1) DELETE FROM products",
+])
+def test_readonly_sql_blocks_writes(db, sql):
+    with core.connect_readonly(db) as conn, pytest.raises((ValueError, sqlite3.DatabaseError)):
+        core.run_readonly_sql(conn, sql)
+    with core.connect_readonly(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 4
+
+
+def test_mcp_server_exposes_tools_and_runs(db, monkeypatch):
+    monkeypatch.setenv("COMPLIANCE_DB", str(db))
+    sys.modules.pop("server", None)
+    import server
+
+    tools = asyncio.run(server.server.list_tools())
+    assert {t.name for t in tools} == {
+        "list_required_documents", "find_registration_gaps", "check_ad_copy",
+        "rejection_pattern_report", "run_readonly_sql",
+    }
+    result = asyncio.run(server.server.call_tool("find_registration_gaps", {"category_code": "FOOD"}))
+    assert "P2" in str(result)
