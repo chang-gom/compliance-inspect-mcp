@@ -75,40 +75,82 @@ def build(db_path: Path) -> None:
             product_seq += 1
             pid = f"P{product_seq:05d}"
             supplier = rng.choice(SUPPLIERS)
-            risky_copy = rng.random() < (0.22 if code == "HFOOD" else 0.08)
-            copy = RISKY_COPY[code] if risky_copy else rng.choice(CLEAN_COPY)
             status = rng.choices(["검수대기", "승인", "반려"], [25, 65, 10])[0]
-            registered = SNAPSHOT - timedelta(days=rng.randint(1, 120))
+            # 승인 상품은 문구 수정을 마친 상태로 본다
+            risky_copy = status != "승인" and rng.random() < (0.22 if code == "HFOOD" else 0.08)
+            copy = RISKY_COPY[code] if risky_copy else rng.choice(CLEAN_COPY)
+            registered = SNAPSHOT - timedelta(days=rng.randint(10, 120))
             conn.execute(
                 "INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (pid, f"{rng.choice(names)} {rng.choice(['A', 'B', 'C'])}형", code, supplier, copy, status,
                  registered.isoformat()),
             )
-            expire_p = 0.25 if supplier == RISKY_SUPPLIER else 0.05
-            for doc_type, _ in docs:
-                roll = rng.random()
-                if roll < 0.08:
-                    continue  # 서류 누락
-                expired = roll < 0.08 + expire_p
-                valid = SNAPSHOT + timedelta(days=-rng.randint(1, 200) if expired else rng.randint(30, 900))
-                conn.execute(
-                    "INSERT INTO product_documents VALUES (?, ?, ?, ?)",
-                    (pid, doc_type, f"DOC-{rng.randint(100000, 999999)}", valid.isoformat()),
-                )
-            _log_inspections(conn, pid, code, supplier, risky_copy, registered)
+            days = _inspection_days(status, registered)
+            doc_issues = _insert_documents(conn, pid, docs, status, supplier, days[-1] if days else None)
+            _log_inspections(conn, pid, supplier, risky_copy, status, days, doc_issues)
     conn.commit()
     _export_csv(conn, HERE / "inspection_log.csv")
     conn.close()
 
 
-def _log_inspections(conn, pid, code, supplier, risky_copy, registered) -> None:
-    for _ in range(rng.randint(2, 5)):
-        day = registered + timedelta(days=rng.randint(0, max(0, (SNAPSHOT - registered).days)))
-        weights = {"DOC_MISSING": 3, "DOC_EXPIRED": 6 if supplier == RISKY_SUPPLIER else 2,
-                   "LABEL_MISMATCH": 3, "AD_CLAIM": 6 if risky_copy else 1, "CATEGORY_WRONG": 1}
-        reject_p = 0.10 + (0.15 if risky_copy else 0) + (0.12 if supplier == RISKY_SUPPLIER else 0)
-        if rng.random() < reject_p:
+def _inspection_days(status: str, registered: date) -> list[date]:
+    """검수대기는 이전 반려 이력 0~2건, 승인·반려는 검수 1~4건. 모두 스냅샷 전날까지."""
+    count = rng.randint(0, 2) if status == "검수대기" else rng.randint(1, 4)
+    span = (SNAPSHOT - timedelta(days=1) - registered).days
+    return sorted(registered + timedelta(days=rng.randint(0, span)) for _ in range(count))
+
+
+def _insert_documents(conn, pid, docs, status, supplier, last_day) -> set[str]:
+    """서류를 넣고, 마지막 검수 시점에 있던 문제(DOC_MISSING/DOC_EXPIRED)를 돌려준다.
+
+    - 누락은 승인 전 상품에만 있다 (승인됐는데 서류가 없는 모순 방지).
+    - 승인 상품의 만료 서류는 승인 뒤에 만료된 것이다 → 재검수 대상.
+    - 일부 유효 서류는 1~30일 안에 만료되도록 둔다 → 만료 임박.
+    """
+    issues = set()
+    expire_p = 0.25 if supplier == RISKY_SUPPLIER else 0.05
+    for doc_type, _ in docs:
+        roll = rng.random()
+        if status != "승인" and roll < 0.08:
+            issues.add("DOC_MISSING")
+            continue
+        if roll < 0.08 + expire_p:
+            if status == "승인":
+                gap = (SNAPSHOT - last_day).days - 1
+                valid = last_day + timedelta(days=rng.randint(1, gap)) if gap >= 1 else SNAPSHOT + timedelta(days=90)
+            else:
+                valid = (last_day or SNAPSHOT) - timedelta(days=rng.randint(1, 200))
+                issues.add("DOC_EXPIRED")
+        else:
+            near = rng.random() < 0.08  # 만료 임박
+            valid = SNAPSHOT + timedelta(days=rng.randint(1, 30) if near else rng.randint(31, 900))
+        conn.execute(
+            "INSERT INTO product_documents VALUES (?, ?, ?, ?)",
+            (pid, doc_type, f"DOC-{rng.randint(100000, 999999)}", valid.isoformat()),
+        )
+    return issues
+
+
+def _log_inspections(conn, pid, supplier, risky_copy, status, days, doc_issues) -> None:
+    """마지막 검수 결과가 상품 상태와 맞도록 만든다 (승인=PASS, 반려·재제출 대기=REJECT)."""
+    weights = {"DOC_MISSING": 3, "DOC_EXPIRED": 6 if supplier == RISKY_SUPPLIER else 2,
+               "LABEL_MISMATCH": 3, "AD_CLAIM": 6 if risky_copy else 1, "CATEGORY_WRONG": 1}
+    reject_p = 0.10 + (0.15 if risky_copy else 0) + (0.12 if supplier == RISKY_SUPPLIER else 0)
+    for i, day in enumerate(days):
+        if i == len(days) - 1:
+            reject = status != "승인"
+            if "DOC_MISSING" in doc_issues:
+                reason = "DOC_MISSING"
+            elif "DOC_EXPIRED" in doc_issues:
+                reason = "DOC_EXPIRED"
+            elif risky_copy:
+                reason = "AD_CLAIM"
+            else:
+                reason = rng.choices(["LABEL_MISMATCH", "CATEGORY_WRONG"], [3, 1])[0]
+        else:
+            reject = rng.random() < reject_p
             reason = rng.choices(list(weights), list(weights.values()))[0]
+        if reject:
             conn.execute("INSERT INTO inspection_log (product_id, inspected_at, result, reason_code) VALUES (?, ?, 'REJECT', ?)",
                          (pid, day.isoformat(), reason))
         else:

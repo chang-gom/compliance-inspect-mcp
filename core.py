@@ -159,6 +159,33 @@ def find_registration_gaps(
     }
 
 
+def find_reinspection_targets(
+    conn: sqlite3.Connection, within_days: int = 30, as_of: str | None = None, limit: int = 50
+) -> dict:
+    """승인 상품 중 필수 서류가 승인 뒤 만료됐거나(EXPIRED) N일 안에 만료되는(EXPIRING) 건을 찾는다."""
+    within_days, as_of = _days(within_days), _as_of(conn, as_of)
+    sql = """
+        SELECT p.product_id, p.name, p.category_code, p.supplier_id, d.doc_type, d.valid_until,
+               CASE WHEN d.valid_until < :as_of THEN 'EXPIRED' ELSE 'EXPIRING' END AS issue,
+               CAST(julianday(d.valid_until) - julianday(:as_of) AS INTEGER) AS days_left
+        FROM products p
+        JOIN required_documents r ON r.category_code = p.category_code
+        JOIN product_documents d ON d.product_id = p.product_id AND d.doc_type = r.doc_type
+        WHERE p.status = '승인'
+          AND d.valid_until IS NOT NULL
+          AND d.valid_until < date(:as_of, '+' || :within || ' days')
+        ORDER BY d.valid_until, p.product_id
+    """
+    rows = [dict(r) for r in conn.execute(sql, {"as_of": as_of, "within": within_days})]
+    return {
+        "as_of": as_of,
+        "within_days": within_days,
+        "counts": {k: sum(r["issue"] == k for r in rows) for k in ("EXPIRED", "EXPIRING")},
+        "items": rows[:limit],
+        "truncated": len(rows) > limit,
+    }
+
+
 def check_ad_copy(conn: sqlite3.Connection, category_code: str, text: str) -> dict:
     """광고 문구에서 카테고리 공통·전용 금지 표현을 찾는다. 최종 판단은 담당자가 한다."""
     category_code = _category(conn, category_code)

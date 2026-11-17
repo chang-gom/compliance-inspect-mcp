@@ -21,15 +21,16 @@ SQL을 직접 쓰지 않고도 확인하도록 만드는 것이 목표입니다.
 
 ```
 core.py          검수 로직 (SQL·규칙). MCP와 분리해 테스트 가능
-server.py        MCP 서버 — core 함수를 도구 5개로 노출 (stdio)
+server.py        MCP 서버 — core 함수를 도구 6개로 노출 (stdio)
 data/seed.py     합성 데이터 생성 → data/compliance.db, data/inspection_log.csv(시각화용)
-tests/           고정 픽스처 기반 테스트 11개 (stdio 연동 포함)
+tests/           고정 픽스처 기반 테스트 26개 (MCP 연동 포함)
 ```
 
 | 도구 | 하는 일 | 구현 포인트 |
 |---|---|---|
 | `list_required_documents` | 카테고리별 필수 서류·근거 법령 | 규칙을 코드가 아닌 테이블로 관리 |
-| `find_registration_gaps` | 필수 서류 누락(MISSING)·만료(EXPIRED) 상품 | CTE + LEFT JOIN, 기준일(as_of) 고정 |
+| `find_registration_gaps` | 검수 전 상품의 필수 서류 누락(MISSING)·만료(EXPIRED) | CTE + LEFT JOIN, 기준일(as_of) 고정 |
+| `find_reinspection_targets` | 승인 후 서류가 만료됐거나(EXPIRED) N일 안에 만료되는(EXPIRING) 재검수 대상 | 남은 일수 계산, 만료일 순 정렬 |
 | `check_ad_copy` | 카테고리 공통·전용 금지 표현 선별 | 결과는 `CLEAR / REVIEW`만, 판정은 사람 |
 | `rejection_pattern_report` | 반려 사유 비중, 카테고리·공급사별 반려율 | 윈도 함수, `group_by` 화이트리스트 |
 | `run_readonly_sql` | 그 외 질문용 SELECT 1문장 | 읽기 전용 연결 + SQLite authorizer |
@@ -40,6 +41,8 @@ tests/           고정 픽스처 기반 테스트 11개 (stdio 연동 포함)
   `WITH ... DELETE`처럼 SELECT로 시작하지 않는 우회도 테스트로 막았습니다.
 - 여러 문장(`;`) 실행 금지, 결과 행 수 상한(`max_rows`)과 잘림 여부(`truncated`)를 함께 반환합니다.
 - 집계 기준 컬럼은 사용자 입력을 SQL에 넣지 않고 허용 목록에서만 고릅니다.
+- 알 수 없는 카테고리·상태값, 잘못된 날짜·기간은 빈 결과 대신 오류로 돌려보냅니다. 빈 결과는 '문제 없음'으로 읽히기 때문입니다.
+- 오류는 이유와 허용값을 담아 MCP 클라이언트에 전달해, Claude가 입력을 고쳐 다시 호출할 수 있게 했습니다.
 - 날짜 판단은 실행 시각이 아니라 데이터 스냅샷 기준일로 고정해, 같은 질문에 같은 답이 나오게 했습니다.
 
 ## 실행
@@ -47,7 +50,7 @@ tests/           고정 픽스처 기반 테스트 11개 (stdio 연동 포함)
 ```bash
 pip install -r requirements.txt
 python data/seed.py          # 합성 DB 생성
-python -m pytest -q          # 11 passed
+python -m pytest -q          # 26 passed
 ```
 
 **Claude Code에 연결**
@@ -74,11 +77,13 @@ claude mcp add compliance-inspect -e COMPLIANCE_DB=$(pwd)/data/compliance.db -- 
 
 | 항목 | 값 |
 |---|---|
-| 상품 / 검수 이력 | 322개 / 1,113건 |
-| 검수대기 상품 중 서류 문제 | 64개 중 14개 (누락 7건, 만료 7건) |
-| 검수대기 상품 중 광고 문구 REVIEW | 64개 중 7개 |
-| 최근 90일 반려 사유 비중 | 표시사항 불일치 27.2% · 서류 누락 26.5% · 광고 표현 20.4% · 서류 만료 19.7% · 오분류 6.1% |
-| 만료 서류가 가장 많은 공급사 | S07 (6건) |
+| 상품 / 검수 이력 | 311개 / 641건 |
+| 검수대기 상품 중 서류 문제 | 83개 중 14개 (누락 8건, 만료 6건) |
+| 승인 상품 중 재검수 대상 (30일 기준) | 207개 중 47개 (승인 후 만료 32건, 만료 임박 16건) |
+| 검수대기 상품 중 광고 문구 REVIEW | 83개 중 12개 |
+| 최근 90일 반려 사유 비중 | 표시사항 불일치 43.9% · 오분류 19.3% · 서류 만료 13.2% · 서류 누락 13.2% · 광고 표현 10.5% |
+| 최근 30일 반려율이 가장 높은 공급사 | S07 (31.9%) |
+| 만료 서류가 가장 많은 공급사 | S07 (12건) |
 
 ## 한계와 다음 단계
 

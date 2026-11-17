@@ -29,13 +29,18 @@ def db(tmp_path):
             ('P1', '누룽지', 'FOOD', 'S01', '맛있는 간식', '검수대기', '2026-11-01'),
             ('P2', '그래놀라', 'FOOD', 'S02', '면역력 강화', '검수대기', '2026-11-01'),
             ('P3', '주전자', 'ELEC', 'S01', '편리함', '검수대기', '2026-11-01'),
-            ('P4', '선풍기', 'ELEC', 'S02', '편리함', '승인', '2026-11-01');
-        -- P1: 서류 2종 정상 / P2: 1종 누락 + 1종 만료 / P3: 정상(유효기간 없음) / P4: 승인건이라 제외
+            ('P4', '선풍기', 'ELEC', 'S02', '편리함', '승인', '2026-11-01'),
+            ('P5', '귀리우유', 'FOOD', 'S01', '고소함', '승인', '2026-09-01');
+        -- P1: 서류 2종 정상 / P2: 1종 누락 + 1종 만료 / P3: 정상(유효기간 없음) / P4·P5: 승인건이라 누락 탐지에서 제외
+        -- 재검수: P4는 16일 뒤 만료(EXPIRING), P5는 승인 후 11/1에 만료(EXPIRED)
         INSERT INTO product_documents VALUES
             ('P1', '품목제조보고서', 'D1', '2027-01-01'),
             ('P1', '자가품질검사성적서', 'D2', '2026-11-15'),
             ('P2', '품목제조보고서', 'D3', '2026-11-14'),
-            ('P3', 'KC 인증서', 'D4', NULL);
+            ('P3', 'KC 인증서', 'D4', NULL),
+            ('P4', 'KC 인증서', 'D5', '2026-12-01'),
+            ('P5', '품목제조보고서', 'D6', '2026-11-01'),
+            ('P5', '자가품질검사성적서', 'D7', '2027-06-01');
         INSERT INTO inspection_log (product_id, inspected_at, result, reason_code) VALUES
             ('P1', '2026-11-10', 'PASS', NULL),
             ('P2', '2026-11-10', 'REJECT', 'AD_CLAIM'),
@@ -109,6 +114,23 @@ def test_rejection_report_rejects_unknown_group(db):
         core.rejection_pattern_report(conn, group_by="product_id; DROP TABLE products")
 
 
+def test_reinspection_targets_expired_after_approval_and_expiring(db):
+    with core.connect_readonly(db) as conn:
+        result = core.find_reinspection_targets(conn, within_days=30)
+        narrow = core.find_reinspection_targets(conn, within_days=10)
+    assert [(i["product_id"], i["doc_type"], i["issue"], i["days_left"]) for i in result["items"]] == [
+        ("P5", "품목제조보고서", "EXPIRED", -14),
+        ("P4", "KC 인증서", "EXPIRING", 16),
+    ]
+    assert result["counts"] == {"EXPIRED": 1, "EXPIRING": 1}
+    assert [i["product_id"] for i in narrow["items"]] == ["P5"]  # 16일 남은 건은 10일 기준에서 제외
+
+
+def test_reinspection_targets_validates_window(db):
+    with core.connect_readonly(db) as conn, pytest.raises(ValueError):
+        core.find_reinspection_targets(conn, within_days=0)
+
+
 def test_readonly_sql_allows_select_and_truncates(db):
     with core.connect_readonly(db) as conn:
         result = core.run_readonly_sql(conn, "SELECT product_id FROM products ORDER BY 1", max_rows=2)
@@ -125,7 +147,7 @@ def test_readonly_sql_blocks_writes(db, sql):
     with core.connect_readonly(db) as conn, pytest.raises((ValueError, sqlite3.DatabaseError)):
         core.run_readonly_sql(conn, sql)
     with core.connect_readonly(db) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 4
+        assert conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 5
 
 
 def test_mcp_server_exposes_tools_and_runs(db, monkeypatch):
@@ -136,7 +158,7 @@ def test_mcp_server_exposes_tools_and_runs(db, monkeypatch):
     tools = asyncio.run(server.server.list_tools())
     assert {t.name for t in tools} == {
         "list_required_documents", "find_registration_gaps", "check_ad_copy",
-        "rejection_pattern_report", "run_readonly_sql",
+        "rejection_pattern_report", "run_readonly_sql", "find_reinspection_targets",
     }
     result = asyncio.run(server.server.call_tool("find_registration_gaps", {"category_code": "FOOD"}))
     assert "P2" in str(result)
