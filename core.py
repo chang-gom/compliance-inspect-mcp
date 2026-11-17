@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 SCHEMA = """
@@ -71,7 +72,46 @@ def snapshot_date(conn: sqlite3.Connection) -> str:
     return conn.execute("SELECT value FROM meta WHERE key = 'snapshot_date'").fetchone()[0]
 
 
+# 잘못된 입력이 빈 결과(= '문제 없음')로 보이지 않도록, 조회 전에 모두 오류로 돌려보낸다.
+STATUSES = ("검수대기", "승인", "반려")
+
+
+def _category(conn: sqlite3.Connection, code: str | None) -> str | None:
+    if code is None:
+        return None
+    valid = [r[0] for r in conn.execute("SELECT category_code FROM categories ORDER BY 1")]
+    normalized = code.strip().upper()
+    if normalized not in valid:
+        raise ValueError(f"알 수 없는 카테고리 '{code}'입니다. 사용 가능: {', '.join(valid)}")
+    return normalized
+
+
+def _status(status: str) -> str:
+    if status not in STATUSES:
+        raise ValueError(f"알 수 없는 상태 '{status}'입니다. 사용 가능: {', '.join(STATUSES)}")
+    return status
+
+
+def _as_of(conn: sqlite3.Connection, as_of: str | None) -> str:
+    if as_of is None:
+        return snapshot_date(conn)
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", as_of):
+            raise ValueError
+        date.fromisoformat(as_of)  # 2026-02-30 같은 없는 날짜 차단
+    except ValueError:
+        raise ValueError(f"기준일 '{as_of}'은 YYYY-MM-DD 형식의 실제 날짜여야 합니다.") from None
+    return as_of
+
+
+def _days(days: int) -> int:
+    if not 1 <= days <= 365:
+        raise ValueError(f"기간은 1~365일이어야 합니다. 입력값: {days}")
+    return days
+
+
 def list_required_documents(conn: sqlite3.Connection, category_code: str | None = None) -> list[dict]:
+    category_code = _category(conn, category_code)
     sql = """
         SELECT r.category_code, c.name AS category_name, r.doc_type, r.legal_basis
         FROM required_documents r JOIN categories c USING (category_code)
@@ -89,7 +129,7 @@ def find_registration_gaps(
     limit: int = 50,
 ) -> dict:
     """필수 서류가 없거나(MISSING) 유효기간이 지난(EXPIRED) 상품을 찾는다."""
-    as_of = as_of or snapshot_date(conn)
+    category_code, status, as_of = _category(conn, category_code), _status(status), _as_of(conn, as_of)
     sql = """
         WITH required AS (
             SELECT p.product_id, p.name, p.category_code, p.supplier_id, r.doc_type
@@ -119,8 +159,9 @@ def find_registration_gaps(
     }
 
 
-def check_ad_copy(category_code: str, text: str) -> dict:
+def check_ad_copy(conn: sqlite3.Connection, category_code: str, text: str) -> dict:
     """광고 문구에서 카테고리 공통·전용 금지 표현을 찾는다. 최종 판단은 담당자가 한다."""
+    category_code = _category(conn, category_code)
     terms = PROHIBITED_TERMS["*"] + PROHIBITED_TERMS.get(category_code, [])
     hits = [
         {"term": t, "position": m.start()}
@@ -142,7 +183,7 @@ def rejection_pattern_report(
     """최근 N일 검수 이력을 묶어 집계한다. reason은 반려 비중, category/supplier는 반려율."""
     if group_by not in GROUP_COLUMNS:
         raise ValueError(f"group_by는 {sorted(GROUP_COLUMNS)} 중 하나여야 합니다.")
-    as_of = as_of or snapshot_date(conn)
+    days, as_of = _days(days), _as_of(conn, as_of)
     col = GROUP_COLUMNS[group_by]  # 화이트리스트 값만 SQL에 넣는다
     period = "l.inspected_at > date(:as_of, '-' || :days || ' days') AND l.inspected_at <= :as_of"
     if group_by == "reason":

@@ -64,11 +64,34 @@ def test_gaps_category_filter_and_limit(db):
     assert len(limited["items"]) == 1 and limited["truncated"] is True
 
 
-def test_ad_copy_detects_category_terms():
-    result = core.check_ad_copy("FOOD", "면역력 강화에 좋은 업계 최고 간식")
-    assert result["verdict"] == "REVIEW"
-    assert [h["term"] for h in result["hits"]] == ["면역력 강화", "최고"]
-    assert core.check_ad_copy("ELEC", "면역력 강화")["verdict"] == "CLEAR"  # 식품 전용 규칙
+def test_ad_copy_detects_category_terms(db):
+    with core.connect_readonly(db) as conn:
+        result = core.check_ad_copy(conn, "FOOD", "면역력 강화에 좋은 업계 최고 간식")
+        assert result["verdict"] == "REVIEW"
+        assert [h["term"] for h in result["hits"]] == ["면역력 강화", "최고"]
+        assert core.check_ad_copy(conn, "ELEC", "면역력 강화")["verdict"] == "CLEAR"  # 식품 전용 규칙
+
+
+def test_lowercase_category_is_normalized_not_missed(db):
+    """소문자 입력이 '문제 없음'으로 보이면 안 된다 (놓침 방지)."""
+    with core.connect_readonly(db) as conn:
+        assert core.check_ad_copy(conn, "food", "면역력 강화")["verdict"] == "REVIEW"
+        assert core.find_registration_gaps(conn, category_code="food")["total_issues"] == 2
+
+
+@pytest.mark.parametrize("call", [
+    lambda c: core.find_registration_gaps(c, category_code="XYZ"),
+    lambda c: core.list_required_documents(c, "XYZ"),
+    lambda c: core.check_ad_copy(c, "XYZ", "문구"),
+    lambda c: core.find_registration_gaps(c, status="대기"),
+    lambda c: core.find_registration_gaps(c, as_of="2026/11/15"),
+    lambda c: core.find_registration_gaps(c, as_of="2026-02-30"),
+    lambda c: core.rejection_pattern_report(c, days=-5),
+    lambda c: core.rejection_pattern_report(c, days=0),
+])
+def test_invalid_input_raises_instead_of_empty_result(db, call):
+    with core.connect_readonly(db) as conn, pytest.raises(ValueError):
+        call(conn)
 
 
 def test_rejection_report_by_reason_and_category(db):

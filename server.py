@@ -46,7 +46,8 @@ def find_registration_gaps(
 @server.tool()
 def check_ad_copy(category_code: str, text: str) -> dict:
     """광고·상세 문구에서 카테고리별 금지·주의 표현을 1차 선별합니다."""
-    return core.check_ad_copy(category_code, text)
+    with core.connect_readonly(DB_PATH) as conn:
+        return core.check_ad_copy(conn, category_code, text)
 
 
 @server.tool()
